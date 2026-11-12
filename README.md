@@ -1,147 +1,261 @@
-# data-explorer — an MCP server for exploring local data
+# MCP Data Explorer
 
-Point any MCP client at a folder of CSV / Parquet / JSON files and it can
-explore them: list tables, read schemas, run **read-only** SQL via DuckDB, profile
-columns, run data-quality checks, and draw charts.
+**AI-Powered Data Exploration | Python • MCP • DuckDB • SQL**
 
-## What MCP is
+A Python-based Model Context Protocol (MCP) server that enables AI assistants like Claude to explore, query, validate, and visualize local datasets using natural language.
 
-**Model Context Protocol** is an open standard (JSON-RPC 2.0 underneath) for connecting AI
-apps to tools and data. You write one *server*, and any MCP *client* — desktop chat apps,
-coding assistants, IDEs, your own agents — can use it.
+Instead of manually writing SQL or Python scripts, users can ask questions about their data, and the AI assistant uses the MCP server to perform the analysis.
 
-```
- ┌──────────── Host (chat app / IDE / agent) ─────────────────┐
- │  LLM  ◀──▶  MCP client  ── stdio or HTTP (JSON-RPC) ──▶  MCP server ──▶ DuckDB ──▶ data/*.csv
- └─────────────────────────────────────────────────────────────┘
-```
+## Overview
 
-A server exposes three primitives:
+MCP Data Explorer bridges AI assistants and structured datasets by exposing secure, read-only data exploration tools.
 
-| Primitive | Who decides to use it | In this project |
-|---|---|---|
-| **Tools** — functions with a JSON schema | the **model** | `list_datasets`, `describe_table`, `query`, `chart`, `profile_column`, `data_quality_report` |
-| **Resources** — read-only data at a URI | the **app / user** attaches them | `schema://all`, `table://{name}/sample` (a URI *template*) |
-| **Prompts** — reusable templated workflows | the **user** picks them (e.g. slash command) | `explore_dataset(table, question)` |
+The application supports CSV, JSON, and Parquet files and uses DuckDB for efficient SQL-based analytics.
 
-Lifecycle: client launches/connects → `initialize` (capability negotiation) →
-`tools/list` → model chooses a tool → `tools/call` → result goes back into the model's context.
+**Example questions:**
 
-The Python SDK turns type hints + docstrings into the JSON schema, so a tool is just a function:
+- "What datasets are available?"
+- "Find duplicate orders and missing customer information."
+- "Calculate total revenue by product."
+- "Identify unusual prices and negative quantities."
+- "Generate a bar chart showing monthly sales."
 
-```python
-@mcp.tool(annotations=READ_ONLY)
-def profile_column(table: str, column: str, top_n: int = 10) -> dict: ...
-```
+## Key Features
 
-> Note: this targets **`mcp` 2.x**, where v1's `FastMCP` was renamed `MCPServer`
-> (`from mcp.server.mcpserver import MCPServer`). Most tutorials online still show v1.
-
-Beyond the three primitives, tools can use the request **`Context`**:
-
-| Feature | In this project |
+| Feature | Description |
 |---|---|
-| **Image content** — a tool returns a PNG as `ImageContent` | `chart(sql, kind, x, y, title)` → bar / line / scatter / histogram via matplotlib (`return Image(data=png, format="png")`) |
-| **Progress** — `ctx.report_progress(i, total, msg)` | `data_quality_report` reports once per column checked |
-| **Elicitation** — the server asks the user a question mid-call | `query` / `chart` ask for confirmation when the referenced tables hold more than `--confirm-rows` rows (default 1,000,000; env `CONFIRM_ROWS`) |
+| Dataset Discovery | Automatically identifies datasets and their schemas |
+| Natural Language Exploration | Allows AI assistants to translate questions into tool calls |
+| SQL Analytics | Executes read-only SQL queries using DuckDB |
+| Data Profiling | Examines column statistics, null values, and distributions |
+| Data Quality Validation | Detects duplicates, missing values, outliers, and invalid records |
+| Data Visualization | Generates bar, line, scatter, and histogram charts |
+| Secure Query Execution | Restricts unsafe SQL and external data access |
+| MCP Integration | Works with compatible MCP clients, including Claude |
 
-Elicitation is written as a **resolver**, so the SDK picks the transport for the negotiated
-protocol (an `InputRequiredResult` the client answers and retries on 2026-07-28, a mid-call
-`elicitation/create` request on older protocols):
+## How It Works
 
-```python
-def _scan_check(sql: str, ctx: Context) -> ScanConfirmation | Elicit[ScanConfirmation]:
-    if catalog.estimated_scan_rows(sql) <= CONFIRM_ROWS or not ctx.client_capabilities.elicitation:
-        return ScanConfirmation(proceed=True)          # no question needed
-    return Elicit("This query scans ~N rows. Run it?", ScanConfirmation)
-
-@mcp.tool()
-def query(sql: str, confirm: Annotated[ElicitationResult[ScanConfirmation], Resolve(_scan_check)]): ...
+```text
+           User
+             |
+             | Natural language question
+             v
+      Claude / AI Assistant
+             |
+             | MCP tool requests
+             v
+       MCP Server (Python)
+             |
+             | Validated SQL queries
+             v
+        DuckDB Engine
+             |
+             | Reads and analyzes
+             v
+      CSV / JSON / Parquet
+             |
+             | Query results
+             v
+      AI Assistant Response
 ```
 
-`confirm` never appears in the tool's input schema; the model only sees `sql` and `max_rows`.
-Clients without elicitation support skip the prompt, because the server is read-only anyway.
+**Example workflow:**
 
-## Design decisions worth noticing
+1. User asks Claude to identify data-quality problems.
+2. Claude invokes the appropriate MCP tools.
+3. The server validates the request.
+4. DuckDB analyzes the dataset.
+5. Results are returned to Claude.
+6. Claude summarizes the findings in plain English.
 
-- **Security is the server's job.** The model writes the SQL, so the server can't trust it:
-  1. only one statement, and it must parse as `SELECT` (or `DESCRIBE`/`SUMMARIZE`/`SHOW`);
-  2. files are loaded into an in-memory DB at startup, then `enable_external_access=false` +
-     `lock_configuration=true` — so even a "SELECT" can't do `read_csv('/etc/passwd')`, and
-     the setting can't be flipped back;
-  3. table/column names are checked against the catalog before they're interpolated.
-- **Errors are for the model.** Expected failures raise `ToolError` with the real DuckDB
-  message, so the model can fix its SQL and retry instead of seeing a generic failure.
-- **Bounded output.** Results are capped (≤1000 rows) with a `truncated` flag — context
-  windows are the scarce resource, so tools should return aggregates, not dumps.
-- **Tool annotations** (`readOnlyHint`, `idempotentHint`) let clients skip confirmation prompts.
-- **Descriptions are prompts.** Docstrings are what the model reads to decide when to call a
-  tool — e.g. `data_quality_report` tells it about `group_by`, and its output suggests retrying
-  with `group_by` when a global outlier fence flags too many rows.
+## Technology Stack
 
-## Run it
+- **Python:** Backend implementation
+- **MCP SDK:** AI-to-tool communication
+- **DuckDB:** SQL query and analytics engine
+- **Pandas / Matplotlib:** Data visualization and analysis capabilities
+- **SQL:** Data exploration and aggregation
+- **Pytest:** Automated testing
+- **Claude:** Example MCP-compatible AI client
+
+## Getting Started
+
+### 1. Clone the Repository
+
+```bash
+git clone https://github.com/Valentina9091/mcp-data-explorer.git
+cd mcp-data-explorer
+```
+
+### 2. Install Dependencies
 
 ```bash
 pip install -r requirements.txt
-python make_sample_data.py          # e-commerce sample with planted data-quality bugs
-python test_client.py               # end-to-end test over stdio: every tool, resource, prompt + guardrails
-pytest -q                           # in-process tests (Client(mcp), no subprocess): tools, chart, progress, elicitation
 ```
 
-Interactive debugging with the official inspector UI:
+### 3. Generate Sample Data
 
 ```bash
-npx @modelcontextprotocol/inspector python server.py --data-dir data
+python make_sample_data.py
 ```
 
-### Connect to Claude Code
+This creates sample e-commerce datasets containing intentionally introduced data-quality issues for testing.
+
+### 4. Run Tests
+
+```bash
+python test_client.py
+pytest -q
+```
+
+### 5. Start the MCP Server
+
+```bash
+python server.py --data-dir data
+```
+
+The server is now ready for an MCP client using standard input/output communication.
+
+## Connect to Claude
+
+### Claude Code
 
 ```bash
 claude mcp add data-explorer -- python /ABS/PATH/server.py --data-dir /ABS/PATH/data
 ```
 
-### Connect to Claude Desktop
+Replace the example paths with the absolute paths on your machine.
 
-Settings → Developer → Edit Config (`claude_desktop_config.json`):
+### Claude Desktop
+
+Add the following to `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "data-explorer": {
       "command": "python",
-      "args": ["/ABS/PATH/server.py", "--data-dir", "/ABS/PATH/data"]
+      "args": [
+        "/ABS/PATH/server.py",
+        "--data-dir",
+        "/ABS/PATH/data"
+      ]
     }
   }
 }
 ```
 
-Restart, then try: *"Use data-explorer to check the orders table for quality problems,
-then tell me revenue by product excluding the bad rows."*
+Restart Claude Desktop after saving the configuration.
 
-### Remote (Streamable HTTP)
+## Available MCP Tools
 
-```bash
-python server.py --data-dir data --http      # serves http://127.0.0.1:8000/mcp
+| Tool | Purpose |
+|---|---|
+| `list_datasets` | Discover available datasets |
+| `describe_table` | Inspect schemas and sample records |
+| `query` | Execute read-only SQL |
+| `profile_column` | Analyze individual column statistics |
+| `data_quality_report` | Detect common data-quality problems |
+| `chart` | Generate visualizations from query results |
+
+The server also exposes MCP resources and reusable prompts for guided dataset exploration.
+
+## Example SQL Query
+
+Calculate revenue by product:
+
+```sql
+SELECT
+    product,
+    SUM(price * quantity) AS revenue
+FROM orders
+GROUP BY product
+ORDER BY revenue DESC;
 ```
 
-For anything beyond localhost, put auth in front (the SDK supports OAuth via `auth=`/`token_verifier=`).
+Claude can generate this query, execute it through the MCP server, and explain the results.
 
-## What the sample data contains (and what the server finds)
+## Data Quality Checks
 
-| Planted issue | Found by |
-|---|---|
-| duplicate `order_id` | `duplicate_key` |
-| 6 fat-finger prices (×40) | `outliers` with `group_by="product"` (globally, laptops drown the signal → 833 false hits + a hint to group) |
-| 4 negative quantities (returns) | `negative_values` |
-| 3 orders dated 2027 | `future_dates` |
-| duplicate customer row, ~8–11% missing emails | `duplicate_rows`, `duplicate_key`, `missing_values` |
+The project supports checks for:
 
-## Extend it
+- Duplicate records and duplicate keys
+- Missing or null values
+- Negative numeric values
+- Unexpected statistical outliers
+- Invalid or future dates
 
-1. **Point it at real data** — drop your own CSV/Parquet files into `data/`.
-2. **Add a Postgres/Snowflake/BigQuery backend** behind the same tools (use a read-only role).
-3. ~~**Add a `chart` tool** that returns a PNG as MCP `ImageContent`.~~ Done: `chart`.
-4. ~~**Use `Context`** for progress notifications on long profiles (`ctx.report_progress`).~~ Done: `data_quality_report`.
-5. ~~**Elicitation** — ask the user to confirm before running a query that scans > N rows.~~ Done: `--confirm-rows`.
-6. ~~**Write pytest tests** using `Client(mcp)` in-process (no subprocess needed).~~ Done: `test_server.py`.
-7. **Sampling** — let `data_quality_report` ask the client's LLM to explain each issue in plain English (`Sample` resolver).
+The sample datasets include deliberately introduced problems to demonstrate these capabilities.
+
+## Security and Reliability
+
+The server is designed around controlled, read-only data access.
+
+- Validates SQL statements before execution
+- Prevents modification of source datasets through SQL tools
+- Disables arbitrary external access from DuckDB queries
+- Validates table and column references
+- Limits query output to prevent oversized responses
+- Provides useful error messages for invalid queries
+- Supports user confirmation for queries that may scan large datasets
+
+For remote access, authentication and appropriate network security should be configured.
+
+## Additional Capabilities
+
+**Data Visualization**
+
+The `chart` tool generates PNG visualizations using Matplotlib.
+
+Supported chart types include bar, line, scatter, and histogram.
+
+**Progress Notifications**
+
+Long-running data-quality checks can report progress to compatible MCP clients.
+
+**Large Query Confirmation**
+
+The server supports confirmation requests when estimated query scans exceed a configurable row threshold.
+
+**HTTP Support**
+
+The MCP server can also run using Streamable HTTP:
+
+```bash
+python server.py --data-dir data --http
+```
+
+Default local endpoint:
+
+`http://127.0.0.1:8000/mcp`
+
+## Project Structure
+
+```text
+mcp-data-explorer/
+├── data/                 # Sample datasets
+├── server.py             # MCP server implementation
+├── ask.py                # Command-line MCP client
+├── make_sample_data.py   # Sample dataset generator
+├── test_client.py        # End-to-end MCP tests
+├── test_server.py        # Server unit/integration tests
+├── requirements.txt      # Python dependencies
+└── README.md             # Project documentation
+```
+
+## Future Enhancements
+
+Potential improvements include:
+
+- PostgreSQL, Snowflake, and BigQuery integrations
+- Additional automated data-quality rules
+- More advanced visualizations
+- Support for large-scale datasets
+- AI-assisted recommendations for resolving data-quality issues
+
+## Project Purpose
+
+This project demonstrates how to integrate AI assistants with real data systems using MCP.
+
+It combines backend engineering, SQL analytics, data validation, secure tool execution, and AI integration to make structured data easier to explore.
+
