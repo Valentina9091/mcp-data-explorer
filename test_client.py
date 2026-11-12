@@ -1,5 +1,5 @@
 """End-to-end smoke test: launches server.py as a subprocess over stdio (exactly how
-Claude Desktop runs it) and exercises every tool, resource and prompt."""
+a desktop MCP client runs it) and exercises every tool, resource and prompt."""
 
 import asyncio
 import json

@@ -1,17 +1,17 @@
 # data-explorer — an MCP server for exploring local data
 
-Point Claude (or any MCP client) at a folder of CSV / Parquet / JSON files and it can
+Point any MCP client at a folder of CSV / Parquet / JSON files and it can
 explore them: list tables, read schemas, run **read-only** SQL via DuckDB, profile
-columns, and run data-quality checks.
+columns, run data-quality checks, and draw charts.
 
 ## What MCP is
 
 **Model Context Protocol** is an open standard (JSON-RPC 2.0 underneath) for connecting AI
-apps to tools and data. You write one *server*, and any MCP *client* — Claude Desktop,
-Claude Code, IDEs, your own agents — can use it.
+apps to tools and data. You write one *server*, and any MCP *client* — desktop chat apps,
+coding assistants, IDEs, your own agents — can use it.
 
 ```
- ┌──────────── Host (Claude Desktop / Claude Code) ────────────┐
+ ┌──────────── Host (chat app / IDE / agent) ─────────────────┐
  │  LLM  ◀──▶  MCP client  ── stdio or HTTP (JSON-RPC) ──▶  MCP server ──▶ DuckDB ──▶ data/*.csv
  └─────────────────────────────────────────────────────────────┘
 ```
@@ -20,7 +20,7 @@ A server exposes three primitives:
 
 | Primitive | Who decides to use it | In this project |
 |---|---|---|
-| **Tools** — functions with a JSON schema | the **model** | `list_datasets`, `describe_table`, `query`, `profile_column`, `data_quality_report` |
+| **Tools** — functions with a JSON schema | the **model** | `list_datasets`, `describe_table`, `query`, `chart`, `profile_column`, `data_quality_report` |
 | **Resources** — read-only data at a URI | the **app / user** attaches them | `schema://all`, `table://{name}/sample` (a URI *template*) |
 | **Prompts** — reusable templated workflows | the **user** picks them (e.g. slash command) | `explore_dataset(table, question)` |
 
@@ -36,6 +36,31 @@ def profile_column(table: str, column: str, top_n: int = 10) -> dict: ...
 
 > Note: this targets **`mcp` 2.x**, where v1's `FastMCP` was renamed `MCPServer`
 > (`from mcp.server.mcpserver import MCPServer`). Most tutorials online still show v1.
+
+Beyond the three primitives, tools can use the request **`Context`**:
+
+| Feature | In this project |
+|---|---|
+| **Image content** — a tool returns a PNG as `ImageContent` | `chart(sql, kind, x, y, title)` → bar / line / scatter / histogram via matplotlib (`return Image(data=png, format="png")`) |
+| **Progress** — `ctx.report_progress(i, total, msg)` | `data_quality_report` reports once per column checked |
+| **Elicitation** — the server asks the user a question mid-call | `query` / `chart` ask for confirmation when the referenced tables hold more than `--confirm-rows` rows (default 1,000,000; env `CONFIRM_ROWS`) |
+
+Elicitation is written as a **resolver**, so the SDK picks the transport for the negotiated
+protocol (an `InputRequiredResult` the client answers and retries on 2026-07-28, a mid-call
+`elicitation/create` request on older protocols):
+
+```python
+def _scan_check(sql: str, ctx: Context) -> ScanConfirmation | Elicit[ScanConfirmation]:
+    if catalog.estimated_scan_rows(sql) <= CONFIRM_ROWS or not ctx.client_capabilities.elicitation:
+        return ScanConfirmation(proceed=True)          # no question needed
+    return Elicit("This query scans ~N rows. Run it?", ScanConfirmation)
+
+@mcp.tool()
+def query(sql: str, confirm: Annotated[ElicitationResult[ScanConfirmation], Resolve(_scan_check)]): ...
+```
+
+`confirm` never appears in the tool's input schema; the model only sees `sql` and `max_rows`.
+Clients without elicitation support skip the prompt, because the server is read-only anyway.
 
 ## Design decisions worth noticing
 
@@ -60,6 +85,7 @@ def profile_column(table: str, column: str, top_n: int = 10) -> dict: ...
 pip install -r requirements.txt
 python make_sample_data.py          # e-commerce sample with planted data-quality bugs
 python test_client.py               # end-to-end test over stdio: every tool, resource, prompt + guardrails
+pytest -q                           # in-process tests (Client(mcp), no subprocess): tools, chart, progress, elicitation
 ```
 
 Interactive debugging with the official inspector UI:
@@ -110,11 +136,12 @@ For anything beyond localhost, put auth in front (the SDK supports OAuth via `au
 | 3 orders dated 2027 | `future_dates` |
 | duplicate customer row, ~8–11% missing emails | `duplicate_rows`, `duplicate_key`, `missing_values` |
 
-## Extend it (good next exercises)
+## Extend it
 
 1. **Point it at real data** — drop your own CSV/Parquet files into `data/`.
 2. **Add a Postgres/Snowflake/BigQuery backend** behind the same tools (use a read-only role).
-3. **Add a `chart` tool** that returns a PNG as MCP `ImageContent`.
-4. **Use `Context`** for progress notifications on long profiles (`ctx.report_progress`).
-5. **Elicitation** — ask the user to confirm before running a query that scans > N rows.
-6. **Write pytest tests** using `Client(mcp)` in-process (no subprocess needed).
+3. ~~**Add a `chart` tool** that returns a PNG as MCP `ImageContent`.~~ Done: `chart`.
+4. ~~**Use `Context`** for progress notifications on long profiles (`ctx.report_progress`).~~ Done: `data_quality_report`.
+5. ~~**Elicitation** — ask the user to confirm before running a query that scans > N rows.~~ Done: `--confirm-rows`.
+6. ~~**Write pytest tests** using `Client(mcp)` in-process (no subprocess needed).~~ Done: `test_server.py`.
+7. **Sampling** — let `data_quality_report` ask the client's LLM to explain each issue in plain English (`Sample` resolver).

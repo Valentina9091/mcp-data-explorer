@@ -1,2 +1,6 @@
 mcp>=2.3,<3
 duckdb>=2.0
+matplotlib>=3.8
+# dev / tests
+pytest>=8
+anyio>=4
